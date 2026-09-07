@@ -28,7 +28,11 @@ class IPBlocklistStore:
 
     def __init__(self, db_path: str | None = None):
         self._path = db_path or config.DB_FILE
-        self._lock = asyncio.Lock()
+        self._lock = asyncio.Lock()  # 仅保护 init_schema 的双检
+        # v9.0.0 R3: 串行化写操作，防 sqlite3.OperationalError: database is locked
+        # （store 用独立 aiosqlite 连接，与主库 DB 池写并发时 WAL busy_timeout 偶发锁竞争；
+        #  串行化写让并发写排队等待而非报错；读操作不受影响，WAL 多读并发）
+        self._write_lock = asyncio.Lock()
         self._initialized = False
 
     async def _get_conn(self) -> aiosqlite.Connection:
@@ -36,7 +40,7 @@ class IPBlocklistStore:
         conn.row_factory = aiosqlite.Row
         await conn.execute("PRAGMA journal_mode=WAL")
         await conn.execute("PRAGMA synchronous=NORMAL")
-        await conn.execute("PRAGMA busy_timeout=10000")
+        await conn.execute("PRAGMA busy_timeout=30000")  # v9.0.0 R3: 10s→30s 防 database is locked 偶发
         return conn
 
     async def init_schema(self) -> None:
@@ -77,49 +81,51 @@ class IPBlocklistStore:
         now = time.time()
         expire_at = (now + ttl_seconds) if ttl_seconds > 0 else 0.0
 
-        conn = await self._get_conn()
-        try:
-            await conn.execute(
-                """
-                INSERT INTO ip_blocklist (ip, block_type, daily_limit, reason, expire_at, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(ip) DO UPDATE SET
-                    block_type=excluded.block_type,
-                    daily_limit=excluded.daily_limit,
-                    reason=excluded.reason,
-                    expire_at=excluded.expire_at,
-                    updated_at=excluded.updated_at
-                """,
-                (ip, block_type, daily_limit, reason, expire_at, now, now),
-            )
-            await conn.commit()
-            # 返回完整记录（含首次 created_at，更新时保持不变）
-            cur = await conn.execute("SELECT * FROM ip_blocklist WHERE ip = ?", (ip,))
-            row = await cur.fetchone()
-            if row:
-                return dict(row)
-            return {
-                "ip": ip,
-                "block_type": block_type,
-                "daily_limit": daily_limit,
-                "reason": reason,
-                "expire_at": expire_at,
-                "created_at": now,
-                "updated_at": now,
-            }
-        finally:
-            await conn.close()
+        async with self._write_lock:  # v9.0.0 R3: 串行化写
+            conn = await self._get_conn()
+            try:
+                await conn.execute(
+                    """
+                    INSERT INTO ip_blocklist (ip, block_type, daily_limit, reason, expire_at, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(ip) DO UPDATE SET
+                        block_type=excluded.block_type,
+                        daily_limit=excluded.daily_limit,
+                        reason=excluded.reason,
+                        expire_at=excluded.expire_at,
+                        updated_at=excluded.updated_at
+                    """,
+                    (ip, block_type, daily_limit, reason, expire_at, now, now),
+                )
+                await conn.commit()
+                # 返回完整记录（含首次 created_at，更新时保持不变）
+                cur = await conn.execute("SELECT * FROM ip_blocklist WHERE ip = ?", (ip,))
+                row = await cur.fetchone()
+                if row:
+                    return dict(row)
+                return {
+                    "ip": ip,
+                    "block_type": block_type,
+                    "daily_limit": daily_limit,
+                    "reason": reason,
+                    "expire_at": expire_at,
+                    "created_at": now,
+                    "updated_at": now,
+                }
+            finally:
+                await conn.close()
 
     async def remove(self, ip: str) -> bool:
         """移除指定 IP 封禁。"""
         await self.init_schema()
-        conn = await self._get_conn()
-        try:
-            cur = await conn.execute("DELETE FROM ip_blocklist WHERE ip = ?", (ip,))
-            await conn.commit()
-            return cur.rowcount > 0
-        finally:
-            await conn.close()
+        async with self._write_lock:  # v9.0.0 R3: 串行化写
+            conn = await self._get_conn()
+            try:
+                cur = await conn.execute("DELETE FROM ip_blocklist WHERE ip = ?", (ip,))
+                await conn.commit()
+                return cur.rowcount > 0
+            finally:
+                await conn.close()
 
     async def get(self, ip: str) -> dict | None:
         """获取单个 IP 的生效规则（若已过期则返回 None 并异步触发清理）。"""
@@ -281,13 +287,14 @@ class IPBlocklistStore:
         """清理已过期记录。"""
         await self.init_schema()
         now = time.time()
-        conn = await self._get_conn()
-        try:
-            cur = await conn.execute("DELETE FROM ip_blocklist WHERE expire_at > 0 AND expire_at < ?", (now,))
-            await conn.commit()
-            return cur.rowcount
-        finally:
-            await conn.close()
+        async with self._write_lock:  # v9.0.0 R3: 串行化写
+            conn = await self._get_conn()
+            try:
+                cur = await conn.execute("DELETE FROM ip_blocklist WHERE expire_at > 0 AND expire_at < ?", (now,))
+                await conn.commit()
+                return cur.rowcount
+            finally:
+                await conn.close()
 
 
 # 单例
