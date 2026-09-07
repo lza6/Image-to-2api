@@ -155,6 +155,7 @@ async def init_schema(conn: aiosqlite.Connection, lock: asyncio.Lock | None = No
 
     若传入 lock，则在锁内执行（与原 DB._init_schema 行为一致：写连接[0] 的锁内跑）。
     """
+
     async def _run() -> None:
         await _create_requests_table(conn)
         await _create_idempotency_table(conn)

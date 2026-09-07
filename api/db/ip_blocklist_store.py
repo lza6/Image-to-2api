@@ -245,8 +245,7 @@ class IPBlocklistStore:
         try:
             if since_ts is not None:
                 cur = await conn.execute(
-                    "SELECT COUNT(*) FROM ip_blocklist"
-                    " WHERE (expire_at = 0 OR expire_at > ?) AND updated_at >= ?",
+                    "SELECT COUNT(*) FROM ip_blocklist WHERE (expire_at = 0 OR expire_at > ?) AND updated_at >= ?",
                     (now, float(since_ts)),
                 )
             else:

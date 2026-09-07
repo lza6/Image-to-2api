@@ -1,7 +1,7 @@
 # imagefree_api 项目配置
 [project]
 name = "imagefree-2ai"
-version = "8.5.0"
+version = "8.6.1"
 description = "High concurrency image generation API"
 requires-python = ">=3.11"
 dependencies = [
@@ -42,11 +42,12 @@ check_untyped_defs = true
 ignore_missing_imports = true
 exclude = ["tests/", "scripts/", "可参考的项目/", "deploy/", "graft/", "landing/", "frontend/"]
 
-# per-module 渐进 strict：先收紧 errors/retry_policy 两个小而核心的模块（0 error 达标）。
-# db/core.py 预存 215 处 strict 错误（dict/list 缺泛型 + Row|None 索引 + aiosqlite 内部属性），
-# 与 P2-3 大文件治理同批处理，本轮不纳入 strict 名单以免牵动大量改动。
+# per-module 渐进 strict：v9.0.0 已扩面到 4 模块（errors/retry_policy + db.core/db.queries）。
+# db.core/db.queries 自身 0 error（v8.5.0 拆分后 dict/list 泛型化 + Row|None 索引 None 检查 +
+# aiosqlite 内部属性 type: ignore[attr-defined]）；剩余 552 错误均为传导错误（config/telemetry
+# 等其他模块），待 v9.5.0 继续扩面收敛。
 [[tool.mypy.overrides]]
-module = ["api.errors", "api.retry_policy"]
+module = ["api.errors", "api.retry_policy", "api.db.core", "api.db.queries"]
 strict = true
 disallow_untyped_defs = true
 disallow_incomplete_defs = true

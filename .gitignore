@@ -108,3 +108,13 @@ frontend/e2e_shots*/
 # External tool artifact (not project code)
 /config/
 .cursor/
+
+# G2 (v9.0.0): .benchmarks 中间产物防再积（仅留 6 基线 png + resp-shots/）
+.benchmarks/*.xml
+.benchmarks/*.txt
+.benchmarks/*.log
+.benchmarks/*.zip
+.benchmarks/*.json
+!.benchmarks/resp-shots/
+!.benchmarks/e2e-desktop.png
+!.benchmarks/e2e-mobile.png

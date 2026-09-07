@@ -19,6 +19,7 @@ import asyncio
 import atexit
 import logging
 import weakref
+from typing import Any
 
 import aiosqlite
 
@@ -31,11 +32,11 @@ log = logging.getLogger("db")
 _WAL_CHECKPOINT_INTERVAL_SECONDS = 300
 
 # 进程内所有 DB 实例（弱引用）+ 全部 aiosqlite 连接（强引用，直到显式 stop）。
-_LIVE_DBS: weakref.WeakSet = weakref.WeakSet()
-_LIVE_CONNS: list = []
+_LIVE_DBS: weakref.WeakSet[DB] = weakref.WeakSet()
+_LIVE_CONNS: list[aiosqlite.Connection] = []
 
 
-def _force_stop_aiosqlite(conn) -> None:
+def _force_stop_aiosqlite(conn: aiosqlite.Connection) -> None:
     """loop 已死或不走 await close 时：关底层 sqlite + 停 aiosqlite 工作线程。"""
     try:
         raw = getattr(conn, "_connection", None)
@@ -70,7 +71,7 @@ class BatchWrite:
 
     __slots__ = ("sql", "params")
 
-    def __init__(self, sql: str, params: tuple):
+    def __init__(self, sql: str, params: tuple[Any, ...]):
         self.sql = sql
         self.params = params
 
@@ -176,7 +177,8 @@ class DB(DBQueriesMixin):
                     raw_conn = getattr(conn, "_connection", None)
                     if raw_conn is not None:
                         raw_conn.close()
-                    conn._stop_running()
+                    # ponytail: aiosqlite 内部属性 _stop_running（mypy: type: ignore[attr-defined]）
+                    conn._stop_running()  # type: ignore[attr-defined]
             except Exception:
                 pass
         self._connections.clear()
@@ -209,7 +211,7 @@ class DB(DBQueriesMixin):
         try:
             cursor = await conn.execute("PRAGMA quick_check")
             row = await cursor.fetchone()
-            return row[0] == "ok"
+            return bool(row is not None and row[0] == "ok")
         except Exception:
             return False
 
@@ -270,7 +272,7 @@ class DB(DBQueriesMixin):
         self._initialized = False
 
     # ── 批量写入 API ─────────────────────────────────
-    async def _enqueue_write(self, sql: str, params: tuple) -> None:
+    async def _enqueue_write(self, sql: str, params: tuple[Any, ...]) -> None:
         """批量模式：入队写操作；非批量模式：立即执行并 commit。"""
         if not self._batch_enabled:
             _, conn, conn_lock = await self._get_write_conn()

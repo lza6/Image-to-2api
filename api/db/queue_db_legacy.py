@@ -1,0 +1,99 @@
+"""QueueDB —— 已废弃的同步持久化队列 DB（兼容层）。
+
+v9.0.0 N3：从 `api/db/queries.py` 拆出以让 queries.py 回到 <800 行上限。
+**已废弃**，仅保留为兼容已有引用（`tests/test_cache_warmup_queries_imap.py` 等）。
+新代码请用 `api.db.queue_store.QueueStore`（异步 aiosqlite）替代。
+"""
+
+from __future__ import annotations
+
+import threading
+import time
+from typing import Any
+
+
+class QueueDB:
+    """持久化队列 DB（同步实现，**已废弃**）。
+
+    ⚠️ 此实现使用同步 sqlite3，会阻塞事件循环。
+    请使用 `api.db.queue_store.QueueStore`（异步 aiosqlite）替代。
+
+    保留仅为兼容已有引用，**不要在新代码中使用**。
+    """
+
+    def __init__(self, path: str):
+        import sqlite3
+
+        self._conn = sqlite3.connect(path, check_same_thread=False)
+        # 极限性能调优参数（v5.2）：与主库一致的写读无锁并发 + 内存缓存
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._conn.execute("PRAGMA busy_timeout=10000")
+        self._conn.execute("PRAGMA cache_size=-64000")  # 64MB
+        self._conn.execute("PRAGMA mmap_size=268435456")  # 256MB
+        self._conn.execute("PRAGMA temp_store=MEMORY")
+        self._lock = threading.Lock()
+        self._init_schema()
+
+    def _init_schema(self) -> None:
+        with self._lock:
+            self._conn.executescript("""
+                CREATE TABLE IF NOT EXISTS task_queue (
+                    id          TEXT PRIMARY KEY,
+                    priority    INT DEFAULT 2,
+                    seq         INT,
+                    created_at  REAL,
+                    status      TEXT DEFAULT 'pending'
+                );
+                CREATE INDEX IF NOT EXISTS idx_queue_status ON task_queue(status);
+                CREATE INDEX IF NOT EXISTS idx_queue_priority ON task_queue(priority, seq);
+            """)
+            self._conn.commit()
+
+    def enqueue(self, task_id: str, priority: int, seq: int) -> None:
+        """写入待消费队列。"""
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO task_queue (id, priority, seq, created_at, status)"
+                " VALUES (?, ?, ?, ?, 'pending')",
+                (task_id, priority, seq, time.time()),
+            )
+            self._conn.commit()
+
+    def mark_processing(self, task_id: str) -> None:
+        """标记为处理中。"""
+        with self._lock:
+            self._conn.execute("UPDATE task_queue SET status='processing' WHERE id=?", (task_id,))
+            self._conn.commit()
+
+    def mark_completed(self, task_id: str) -> None:
+        """标记为已完成。"""
+        with self._lock:
+            self._conn.execute("UPDATE task_queue SET status='completed' WHERE id=?", (task_id,))
+            self._conn.commit()
+
+    def list_pending(self) -> list[tuple[int, int, str]]:
+        """返回所有 pending 任务，按 priority/seq 升序。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT priority, seq, id FROM task_queue WHERE status='pending' ORDER BY priority, seq"
+            ).fetchall()
+            return [(r[0], r[1], r[2]) for r in rows]
+
+    def cleanup(self, retention_days: int = 7) -> dict[str, Any]:
+        """清理超期 completed/processing 记录，返回删除数。"""
+        cutoff = time.time() - retention_days * 86400
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM task_queue WHERE status IN ('completed','processing') AND created_at < ?",
+                (cutoff,),
+            )
+            self._conn.commit()
+            try:
+                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except Exception:
+                pass
+            return {"deleted": cur.rowcount}
+
+    def close(self) -> None:
+        self._conn.close()

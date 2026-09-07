@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import logging
 import os
-import threading
 import time
 from typing import Any  # noqa: F401  (保留供后续 mypy strict 升级 dict→dict[str,Any] 使用)
 
@@ -30,6 +29,32 @@ class DBQueriesMixin:
     宿主类须提供连接池与批量写基础设施（见模块 docstring）。本 mixin 只含
     业务 SQL 拼装与结果塑形逻辑，不持有连接状态。
     """
+
+    # ponytail: mypy strict——宿主类（DB）提供这些属性/方法，Mixin 声明为 Protocol
+    # 形态的类型提示供 mypy 解析，避免 attr-defined 误报。运行时仍由 DB 类注入。
+    _path: str
+    _connections: list[aiosqlite.Connection]
+    _conn_locks: list[Any]  # asyncio.Lock 运行时注入
+    _commit_count: int
+    _batch_enabled: bool
+    _batch_window: float
+    _write_buffer: list[Any]  # BatchWrite 条目
+    _batch_running: bool
+
+    async def _enqueue_write(self, sql: str, params: tuple[Any, ...]) -> None:  # noqa: D401
+        raise NotImplementedError  # ponytail: 宿主类注入
+
+    async def _get_read_conn(self) -> aiosqlite.Connection:
+        raise NotImplementedError  # ponytail: 宿主类注入
+
+    async def _get_write_conn(self) -> tuple[int, aiosqlite.Connection, Any]:
+        raise NotImplementedError  # ponytail: 宿主类注入
+
+    async def _ensure_flushed(self) -> None:
+        raise NotImplementedError  # ponytail: 宿主类注入
+
+    def _get_lock(self) -> Any:  # asyncio.Lock 在运行时注入
+        raise NotImplementedError  # ponytail: 宿主类注入
 
     # ── 写 ────────────────────────────────────────
     async def create_request(
@@ -205,7 +230,7 @@ class DBQueriesMixin:
         "aspect_ratio",
     )
 
-    async def get(self, task_id: str) -> dict | None:
+    async def get(self, task_id: str) -> dict[str, Any] | None:
         await self._ensure_flushed()
         conn = await self._get_read_conn()
         cursor = await conn.execute("SELECT * FROM requests WHERE id=?", (task_id,))
@@ -214,7 +239,7 @@ class DBQueriesMixin:
             return None
         return self._row_to_dict(row)
 
-    async def get_public(self, task_id: str) -> dict | None:
+    async def get_public(self, task_id: str) -> dict[str, Any] | None:
         """轻量查询：只取公共 API 响应字段（不含 prompt）。"""
         await self._ensure_flushed()
         cols = ", ".join(self._PUBLIC_COLS)
@@ -232,11 +257,11 @@ class DBQueriesMixin:
         status: str | None = None,
         model: str | None = None,
         sort: str = "created_at",
-    ) -> tuple[list[dict], int]:
+    ) -> tuple[list[dict[str, Any]], int]:
         """任务列表查询（IMP-41）。"""
         await self._ensure_flushed()
         where = []
-        params: list = []
+        params: list[Any] = []
         if status:
             where.append("status=?")
             params.append(status)
@@ -247,7 +272,7 @@ class DBQueriesMixin:
         conn = await self._get_read_conn()
         total_cursor = await conn.execute(f"SELECT COUNT(*) FROM requests{where_clause}", params)
         total_row = await total_cursor.fetchone()
-        total = int(total_row[0])
+        total = int(total_row[0]) if total_row is not None else 0
         allowed_sort = {"created_at", "duration_sec", "finished_at", "status", "model"}
         if sort not in allowed_sort:
             sort = "created_at"
@@ -261,7 +286,7 @@ class DBQueriesMixin:
         items = [self._row_to_dict(r) for r in rows]
         return items, total
 
-    async def recent_images(self, limit: int = 50) -> list[dict]:
+    async def recent_images(self, limit: int = 50) -> list[dict[str, Any]]:
         """画廊：最近完成的、有图的请求。"""
         await self._ensure_flushed()
         cols = ", ".join(self._GALLERY_COLS)
@@ -274,20 +299,20 @@ class DBQueriesMixin:
         rows = await cursor.fetchall()
         return [self._row_to_dict(r) for r in rows]
 
-    async def recent_errors(self, limit: int = 20) -> list[dict]:
+    async def recent_errors(self, limit: int = 20) -> list[dict[str, Any]]:
         """最近失败的请求（含错误原因/prompt），供在线排查。"""
         await self._ensure_flushed()
         cols = ", ".join(self._ERROR_COLS)
         conn = await self._get_read_conn()
         cursor = await conn.execute(
-            f"SELECT {cols} FROM requests WHERE status='error'" " ORDER BY created_at DESC LIMIT ?",
+            f"SELECT {cols} FROM requests WHERE status='error' ORDER BY created_at DESC LIMIT ?",
             (limit,),
         )
         rows = await cursor.fetchall()
         return [self._row_to_dict(r) for r in rows]
 
     # ── 统计 ──────────────────────────────────────
-    async def stats_overview(self) -> dict:
+    async def stats_overview(self) -> dict[str, Any]:
         """总量 + 平均出图耗时。"""
         await self._ensure_flushed()
         conn = await self._get_read_conn()
@@ -300,7 +325,10 @@ class DBQueriesMixin:
             " FROM requests"
         )
         row = await cursor.fetchone()
-        total, images, errors, avg_duration = row
+        if row is None:
+            total, images, errors, avg_duration = 0, 0, 0, 0
+        else:
+            total, images, errors, avg_duration = row
         return {
             "total_requests": int(total or 0),
             "total_images": int(images or 0),
@@ -308,7 +336,7 @@ class DBQueriesMixin:
             "avg_duration_sec": round(float(avg_duration), 1) if avg_duration else None,
         }
 
-    async def stats_daily(self, days: int = 14) -> list[dict]:
+    async def stats_daily(self, days: int = 14) -> list[dict[str, Any]]:
         """近 N 天：每天请求/出图/失败（IMP-07: 直接用 day 列）。"""
         await self._ensure_flushed()
         import datetime
@@ -327,7 +355,7 @@ class DBQueriesMixin:
         rows = await cursor.fetchall()
         return [{"day": r[0], "total": r[1], "images": r[2], "errors": r[3]} for r in rows]
 
-    async def stats_monthly(self, months: int = 12) -> list[dict]:
+    async def stats_monthly(self, months: int = 12) -> list[dict[str, Any]]:
         """近 N 月：每月请求/出图/失败。"""
         await self._ensure_flushed()
         import datetime
@@ -353,14 +381,14 @@ class DBQueriesMixin:
         return [{"month": r[0], "total": r[1], "images": r[2], "errors": r[3]} for r in rows]
 
     # ── 增长治理（M7）──────────────────────────────
-    async def cleanup(self, retention_days: int) -> dict:
+    async def cleanup(self, retention_days: int) -> dict[str, Any]:
         """TTL 清理：删除超期请求记录，回收 WAL 并 VACUUM 压缩文件。"""
         await self._ensure_flushed()
         cutoff = time.time() - retention_days * 86400
         conn0 = self._connections[0]
         db_cursor = await conn0.execute("PRAGMA database_list")
         db_row = await db_cursor.fetchone()
-        path = db_row[2]
+        path = db_row[2] if db_row is not None else self._path
         size_before = os.path.getsize(path) if os.path.exists(path) else 0
         _, conn, conn_lock = await self._get_write_conn()
         async with conn_lock:
@@ -383,7 +411,7 @@ class DBQueriesMixin:
         size_after = os.path.getsize(path) if os.path.exists(path) else 0
         return {"deleted": deleted, "size_before": size_before, "size_after": size_after}
 
-    async def cleanup_batched(self, retention_days: int, batch_size: int = 5000) -> dict:
+    async def cleanup_batched(self, retention_days: int, batch_size: int = 5000) -> dict[str, Any]:
         """TTL 回收（分批，避免单条长 DELETE 锁表/占用内存）：删除超期请求记录。
 
         每批先 `SELECT id ... WHERE created_at < ? LIMIT ?` 选出超期 id（SQLite 默认构建
@@ -396,24 +424,20 @@ class DBQueriesMixin:
         conn0 = self._connections[0]
         db_cursor = await conn0.execute("PRAGMA database_list")
         db_row = await db_cursor.fetchone()
-        path = db_row[2]
+        path = db_row[2] if db_row is not None else self._path
         size_before = os.path.getsize(path) if os.path.exists(path) else 0
         _, conn, conn_lock = await self._get_write_conn()
         deleted = 0
         batches = 0
         async with conn_lock:
             while True:
-                sel = await conn.execute(
-                    "SELECT id FROM requests WHERE created_at < ? LIMIT ?", (cutoff, batch_size)
-                )
+                sel = await conn.execute("SELECT id FROM requests WHERE created_at < ? LIMIT ?", (cutoff, batch_size))
                 rows = await sel.fetchall()
                 if not rows:
                     break
                 ids = [r[0] for r in rows]
                 placeholders = ",".join("?" * len(ids))
-                cur = await conn.execute(
-                    f"DELETE FROM requests WHERE id IN ({placeholders})", ids
-                )
+                cur = await conn.execute(f"DELETE FROM requests WHERE id IN ({placeholders})", ids)
                 await conn.commit()
                 deleted += cur.rowcount
                 batches += 1
@@ -439,7 +463,7 @@ class DBQueriesMixin:
         conn = await self._get_read_conn()
         cursor = await conn.execute("SELECT COUNT(*) FROM requests")
         row = await cursor.fetchone()
-        return int(row[0])
+        return int(row[0]) if row is not None else 0
 
     async def count_recent_requests(self, window_seconds: float = 60.0) -> int:
         """P-04: 统计过去 window_seconds 秒内创建的请求数。"""
@@ -451,7 +475,7 @@ class DBQueriesMixin:
         return int(row[0]) if row else 0
 
     @staticmethod
-    def _row_to_dict(row: aiosqlite.Row, default: bool = True) -> dict:
+    def _row_to_dict(row: aiosqlite.Row, default: bool = True) -> dict[str, Any]:
         keys = row.keys()
         d = dict(zip(keys, row))
         if "download" in d:
@@ -515,7 +539,7 @@ class DBQueriesMixin:
     async def save_idempotency(self, key: str, task_id: str) -> None:
         """保存幂等 key → task_id 映射。"""
         await self._enqueue_write(
-            "INSERT OR REPLACE INTO idempotency_keys (idempotency_key, task_id, created_at)" " VALUES (?, ?, ?)",
+            "INSERT OR REPLACE INTO idempotency_keys (idempotency_key, task_id, created_at) VALUES (?, ?, ?)",
             (key, task_id, time.time()),
         )
 
@@ -539,9 +563,7 @@ class DBQueriesMixin:
                 await conn.commit()
                 self._commit_count += 1
                 return task_id
-            existing = await conn.execute(
-                "SELECT task_id FROM idempotency_keys WHERE idempotency_key=?", (key,)
-            )
+            existing = await conn.execute("SELECT task_id FROM idempotency_keys WHERE idempotency_key=?", (key,))
             row = await existing.fetchone()
             await conn.commit()
             self._commit_count += 1
@@ -557,7 +579,7 @@ class DBQueriesMixin:
             self._commit_count += 1
             return task_id
 
-    async def get_idempotency(self, key: str) -> dict | None:
+    async def get_idempotency(self, key: str) -> dict[str, Any] | None:
         """查询幂等 key，返回 {idempotency_key, task_id, created_at} 或 None。"""
         await self._ensure_flushed()
         conn = await self._get_read_conn()
@@ -589,7 +611,7 @@ class DBQueriesMixin:
             (task_id, task_id, model, error, attempts, now, now, error),
         )
 
-    async def list_dlq(self, limit: int = 20) -> list[dict]:
+    async def list_dlq(self, limit: int = 20) -> list[dict[str, Any]]:
         """列出死信队列记录，按 created_at 降序。"""
         await self._ensure_flushed()
         conn = await self._get_read_conn()
@@ -665,97 +687,16 @@ class DBQueriesMixin:
             return cur.rowcount
 
 
-# ── 旧同步实现（已废弃，保留仅为兼容）─────────────────────────────────────────
+# ── 旧同步实现（已废弃，v9.0.0 N3 拆出到 queue_db_legacy.py）─────────────────
+# 显式 re-export：from api.db.queries import QueueDB / import * 均可用，
+# 匹配 account_pool/pool.py、email_pool.py 的兼容垫片模式（非 __getattr__，
+# 因 PEP 562 不触发于 import * 且不利于静态分析）。
 
 
-class QueueDB:
-    """持久化队列 DB（同步实现，**已废弃**）。
-
-    ⚠️ 此实现使用同步 sqlite3，会阻塞事件循环。
-    请使用 `api.db.queue_store.QueueStore`（异步 aiosqlite）替代。
-
-    保留仅为兼容已有引用，**不要在新代码中使用**。
-    """
-
-    def __init__(self, path: str):
-        import sqlite3
-
-        self._conn = sqlite3.connect(path, check_same_thread=False)
-        # 极限性能调优参数（v5.2）：与主库一致的写读无锁并发 + 内存缓存
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA synchronous=NORMAL")
-        self._conn.execute("PRAGMA busy_timeout=10000")
-        self._conn.execute("PRAGMA cache_size=-64000")  # 64MB
-        self._conn.execute("PRAGMA mmap_size=268435456")  # 256MB
-        self._conn.execute("PRAGMA temp_store=MEMORY")
-        self._lock = threading.Lock()
-        self._init_schema()
-
-    def _init_schema(self) -> None:
-        with self._lock:
-            self._conn.executescript("""
-                CREATE TABLE IF NOT EXISTS task_queue (
-                    id          TEXT PRIMARY KEY,
-                    priority    INT DEFAULT 2,
-                    seq         INT,
-                    created_at  REAL,
-                    status      TEXT DEFAULT 'pending'
-                );
-                CREATE INDEX IF NOT EXISTS idx_queue_status ON task_queue(status);
-                CREATE INDEX IF NOT EXISTS idx_queue_priority ON task_queue(priority, seq);
-            """)
-            self._conn.commit()
-
-    def enqueue(self, task_id: str, priority: int, seq: int) -> None:
-        """写入待消费队列。"""
-        with self._lock:
-            self._conn.execute(
-                "INSERT OR IGNORE INTO task_queue (id, priority, seq, created_at, status)"
-                " VALUES (?, ?, ?, ?, 'pending')",
-                (task_id, priority, seq, time.time()),
-            )
-            self._conn.commit()
-
-    def mark_processing(self, task_id: str) -> None:
-        """标记为处理中。"""
-        with self._lock:
-            self._conn.execute("UPDATE task_queue SET status='processing' WHERE id=?", (task_id,))
-            self._conn.commit()
-
-    def mark_completed(self, task_id: str) -> None:
-        """标记为已完成。"""
-        with self._lock:
-            self._conn.execute("UPDATE task_queue SET status='completed' WHERE id=?", (task_id,))
-            self._conn.commit()
-
-    def list_pending(self) -> list[tuple[int, int, str]]:
-        """返回所有 pending 任务，按 priority/seq 升序。"""
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT priority, seq, id FROM task_queue" " WHERE status='pending' ORDER BY priority, seq"
-            ).fetchall()
-            return [(r[0], r[1], r[2]) for r in rows]
-
-    def cleanup(self, retention_days: int = 7) -> dict:
-        """清理超期 completed/processing 记录，返回删除数。"""
-        cutoff = time.time() - retention_days * 86400
-        with self._lock:
-            cur = self._conn.execute(
-                "DELETE FROM task_queue WHERE status IN ('completed','processing') AND created_at < ?",
-                (cutoff,),
-            )
-            self._conn.commit()
-            try:
-                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            except Exception:
-                pass
-            return {"deleted": cur.rowcount}
-
-    def close(self) -> None:
-        self._conn.close()
+from .queue_db_legacy import QueueDB as QueueDB  # noqa: F401  (兼容垫片：旧 import 路径)
 
 
-def task_to_public(t: dict) -> dict:
+def task_to_public(t: dict[str, Any]) -> dict[str, Any]:
     """数据库行 → API 响应结构。"""
     from ..geo_ip import guess_country
 

@@ -80,7 +80,7 @@ class QueueStore:
         """返回按 priority/seq 排序的 pending 任务 [(priority, seq, task_id)]。"""
         await self.open()
         cur = await self._conn.execute(
-            "SELECT priority, seq, task_id FROM task_queue WHERE status = 'pending'" " ORDER BY priority ASC, seq ASC"
+            "SELECT priority, seq, task_id FROM task_queue WHERE status = 'pending' ORDER BY priority ASC, seq ASC"
         )
         rows = await cur.fetchall()
         return [(r["priority"], r["seq"], r["task_id"]) for r in rows]

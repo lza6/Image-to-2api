@@ -72,8 +72,7 @@ class LeaseStore:
                 await self._conn.rollback()
                 return False
             await self._conn.execute(
-                "INSERT OR REPLACE INTO edit_leases(key, holder, token, expires_at, created_at)"
-                " VALUES(?, ?, ?, ?, ?)",
+                "INSERT OR REPLACE INTO edit_leases(key, holder, token, expires_at, created_at) VALUES(?, ?, ?, ?, ?)",
                 (key, holder, token, now + ttl, now),
             )
             await self._conn.commit()
